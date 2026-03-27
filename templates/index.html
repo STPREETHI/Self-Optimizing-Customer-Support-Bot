@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NeuralSupport OS — Self-Optimizing Support System</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=JetBrains+Mono:wght@300;400;600&display=swap" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <canvas id="bg-canvas"></canvas>
+
+  <div class="os-shell">
+    <aside class="sidebar">
+      <div class="sidebar-logo">
+        <span class="logo-icon">⬡</span>
+        <div>
+          <div class="logo-title">NeuralSupport</div>
+          <div class="logo-sub">OS v2.0.0</div>
+        </div>
+      </div>
+
+      <div class="sys-status">
+        <div class="status-dot pulse"></div>
+        <span id="health-label">Connecting…</span>
+      </div>
+
+      <nav class="sidebar-nav">
+        <button class="nav-btn active" data-panel="chat">💬 Chat Console</button>
+        <button class="nav-btn" data-panel="analytics">📊 Analytics</button>
+        <button class="nav-btn" data-panel="evolution">🧬 Prompt DNA</button>
+        <button class="nav-btn" data-panel="kb">📚 Knowledge Base</button>
+      </nav>
+
+      <div class="sidebar-section">
+        <div class="section-label">STYLE WEIGHTS</div>
+        <div id="style-bars"></div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="section-label">TOP STYLE</div>
+        <div id="best-prompt-badge" class="best-badge">—</div>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <section id="panel-chat" class="panel active">
+        <div class="panel-header">
+          <h1>Chat Console</h1>
+          <div class="header-meta">
+            <span id="total-interactions">0 interactions</span>
+            <div class="user-chip">
+              <span>👤</span>
+              <input id="user-id-input" value="demo-user" title="User ID" />
+            </div>
+          </div>
+        </div>
+
+        <div class="chat-viewport" id="chat-viewport">
+          <div class="chat-welcome">
+            <div class="welcome-icon">⬡</div>
+            <p>Ask anything. The system learns from every response.</p>
+          </div>
+        </div>
+
+        <div class="chat-composer">
+          <textarea id="query-input" placeholder="Describe your issue… (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+          <button id="send-btn" class="send-btn" title="Send">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+          </button>
+        </div>
+      </section>
+
+      <section id="panel-analytics" class="panel">
+        <div class="panel-header">
+          <h1>Analytics Dashboard</h1>
+          <button class="refresh-btn" onclick="loadAnalytics()">↻ Refresh</button>
+        </div>
+
+        <div class="analytics-grid">
+          <div class="metric-card" id="m-total"><div class="metric-label">Total Interactions</div><div class="metric-value" id="mv-total">—</div></div>
+          <div class="metric-card" id="m-accuracy"><div class="metric-label">Avg Response Score</div><div class="metric-value" id="mv-accuracy">—</div></div>
+          <div class="metric-card" id="m-resolution"><div class="metric-label">Resolution Rate</div><div class="metric-value" id="mv-resolution">—</div></div>
+          <div class="metric-card" id="m-satisfaction"><div class="metric-label">Avg Satisfaction</div><div class="metric-value" id="mv-satisfaction">—</div></div>
+        </div>
+
+        <div class="charts-row">
+          <div class="chart-card"><div class="chart-title">Score Trend Over Time</div><canvas id="trend-chart" height="200"></canvas></div>
+          <div class="chart-card"><div class="chart-title">Top Issue Intents</div><canvas id="intent-chart" height="200"></canvas></div>
+        </div>
+      </section>
+
+      <section id="panel-evolution" class="panel">
+        <div class="panel-header">
+          <h1>Prompt DNA — Evolution Log</h1>
+          <button class="refresh-btn" onclick="loadEvolution()">↻ Refresh</button>
+        </div>
+        <div id="evolution-timeline" class="timeline"></div>
+      </section>
+
+      <section id="panel-kb" class="panel">
+        <div class="panel-header"><h1>Knowledge Base</h1></div>
+        <div class="kb-add">
+          <textarea id="kb-doc-input" placeholder="Paste a new KB document to add…" rows="3"></textarea>
+          <button onclick="addKbDoc()">+ Add to KB</button>
+        </div>
+        <div id="kb-list" class="kb-list">
+          <p class="muted">KB entries are seeded from optimizer.py. Add new docs above to expand retrieval coverage.</p>
+          <div class="kb-seed-list">
+            <div class="kb-item">🔑 Login issue: clear stale sessions, sync system clock, reset password tokens.</div>
+            <div class="kb-item">💳 Refund issue: verify transaction ID, eligibility window, and payment gateway status.</div>
+            <div class="kb-item">⚡ Performance issue: inspect latency, deployment changes, and cache hit rate.</div>
+            <div class="kb-item">🔌 API errors: validate key scope, rate limits, and request schema.</div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+<script>
+(function() {
+  const canvas = document.getElementById('bg-canvas');
+  const ctx = canvas.getContext('2d');
+  let W, H;
+  function resize() { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }
+  resize();
+  window.addEventListener('resize', resize);
+
+  const COLS = 40, ROWS = 25;
+  let t = 0;
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    const cw = W / COLS, ch = H / ROWS;
+    ctx.strokeStyle = 'rgba(0,245,180,0.06)';
+    ctx.lineWidth = 1;
+    for (let c = 0; c <= COLS; c++) { ctx.beginPath(); ctx.moveTo(c * cw, 0); ctx.lineTo(c * cw, H); ctx.stroke(); }
+    for (let r = 0; r <= ROWS; r++) { ctx.beginPath(); ctx.moveTo(0, r * ch); ctx.lineTo(W, r * ch); ctx.stroke(); }
+
+    for (let c = 0; c < COLS; c += 4) {
+      for (let r = 0; r < ROWS; r += 4) {
+        const alpha = 0.08 + 0.07 * Math.sin(t * 0.02 + c * 0.3 + r * 0.2);
+        ctx.fillStyle = `rgba(0,245,180,${alpha})`;
+        ctx.beginPath();
+        ctx.arc(c * cw, r * ch, 1.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    t++;
+    requestAnimationFrame(draw);
+  }
+  draw();
+})();
+
+document.querySelectorAll('.nav-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    const pid = 'panel-' + btn.dataset.panel;
+    document.getElementById(pid).classList.add('active');
+    if (btn.dataset.panel === 'analytics') loadAnalytics();
+    if (btn.dataset.panel === 'evolution') loadEvolution();
+  });
+});
+
+async function checkHealth() {
+  try {
+    const r = await fetch('/api/health');
+    const ok = r.ok;
+    document.getElementById('health-label').textContent = ok ? 'Backend Online' : 'Backend Error';
+    document.querySelector('.status-dot').style.background = ok ? '#00f5b4' : '#f87171';
+  } catch {
+    document.getElementById('health-label').textContent = 'Backend Offline';
+    document.querySelector('.status-dot').style.background = '#f87171';
+  }
+}
+checkHealth();
+setInterval(checkHealth, 15000);
+
+const viewport = document.getElementById('chat-viewport');
+const queryInput = document.getElementById('query-input');
+const sendBtn = document.getElementById('send-btn');
+let interactionCount = 0;
+
+queryInput.addEventListener('input', () => {
+  queryInput.style.height = 'auto';
+  queryInput.style.height = Math.min(queryInput.scrollHeight, 160) + 'px';
+});
+queryInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+sendBtn.addEventListener('click', sendMessage);
+
+async function sendMessage() {
+  const query = queryInput.value.trim();
+  const userId = document.getElementById('user-id-input').value.trim() || 'demo-user';
+  if (!query) return;
+
+  document.querySelector('.chat-welcome')?.remove();
+  appendBubble('user', query);
+  queryInput.value = '';
+  queryInput.style.height = 'auto';
+  sendBtn.disabled = true;
+
+  const typing = appendTyping();
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: userId, query })
+    });
+    const data = await res.json();
+    typing.remove();
+
+    if (data.error) {
+      appendBubble('error', '⚠ ' + data.error);
+    } else {
+      appendResponseCard(data);
+      interactionCount++;
+      document.getElementById('total-interactions').textContent = interactionCount + ' interactions';
+      loadStyleWeights();
+      loadAnalytics();
+    }
+  } catch (err) {
+    typing.remove();
+    appendBubble('error', '⚠ Network error: ' + err.message);
+  }
+  sendBtn.disabled = false;
+}
+
+function appendBubble(type, text) {
+  const div = document.createElement('div');
+  div.className = `bubble bubble-${type}`;
+  div.textContent = text;
+  viewport.appendChild(div);
+  viewport.scrollTop = viewport.scrollHeight;
+  return div;
+}
+
+function appendTyping() {
+  const div = document.createElement('div');
+  div.className = 'bubble bubble-typing';
+  div.innerHTML = '<span></span><span></span><span></span>';
+  viewport.appendChild(div);
+  viewport.scrollTop = viewport.scrollHeight;
+  return div;
+}
+
+const INTENT_COLORS = { refund: '#f59e0b', complaint: '#ef4444', technical_issue: '#3b82f6', query: '#8b5cf6', account: '#06b6d4' };
+const STYLE_ICONS = { professional: '🎩', empathetic: '💙', technical: '⚙️', simple: '📖' };
+
+function appendResponseCard(d) {
+  const card = document.createElement('div');
+  card.className = 'response-card';
+  const intentColor = INTENT_COLORS[d.intent] || '#00f5b4';
+  const styleIcon = STYLE_ICONS[d.chosen_style] || '💬';
+  const score = d.score?.total ?? '?';
+  const conf = d.score?.confidence ?? '?';
+
+  card.innerHTML = `
+    <div class="rc-meta">
+      <span class="badge" style="background:${intentColor}22;color:${intentColor};border-color:${intentColor}44">${d.intent}</span>
+      <span class="badge badge-style">${styleIcon} ${d.chosen_style}</span>
+      <span class="badge badge-score">Score ${score}</span>
+      <span class="badge badge-conf">Conf ${conf}</span>
+      <span class="iid muted">#${d.interaction_id}</span>
+    </div>
+    <div class="rc-response">${escHtml(d.response)}</div>
+    ${d.retrieved_knowledge?.length ? `<details class="rc-context"><summary>📚 Retrieved context (${d.retrieved_knowledge.length})</summary><ul>${d.retrieved_knowledge.map(s => `<li>${escHtml(s)}</li>`).join('')}</ul></details>` : ''}
+    <div class="rc-feedback" data-id="${d.interaction_id}">
+      <span class="muted">Was this helpful?</span>
+      <button class="fb-btn" data-liked="true" title="Helpful">👍</button>
+      <button class="fb-btn" data-liked="false" title="Not helpful">👎</button>
+      <button class="fb-btn fb-resolved" data-resolved="true" title="Resolved">✅ Resolved</button>
+      <button class="fb-btn fb-resolved" data-resolved="false" title="Not resolved">❌ Unresolved</button>
+      <input class="fb-text" placeholder="Optional note…" />
+      <button class="fb-submit" onclick="submitFeedback(this)">Submit</button>
+      <span class="fb-status"></span>
+    </div>`;
+
+  viewport.appendChild(card);
+  viewport.scrollTop = viewport.scrollHeight;
+
+  card.querySelectorAll('.fb-btn[data-liked]').forEach(b => {
+    b.addEventListener('click', () => {
+      card.querySelectorAll('.fb-btn[data-liked]').forEach(x => x.classList.remove('selected'));
+      b.classList.add('selected');
+    });
+  });
+  card.querySelectorAll('.fb-btn[data-resolved]').forEach(b => {
+    b.addEventListener('click', () => {
+      card.querySelectorAll('.fb-btn[data-resolved]').forEach(x => x.classList.remove('selected'));
+      b.classList.add('selected');
+    });
+  });
+}
+
+async function submitFeedback(btn) {
+  const rc = btn.closest('.rc-feedback');
+  const id = parseInt(rc.dataset.id);
+  const likedBtn = rc.querySelector('.fb-btn[data-liked].selected');
+  const resolvedBtn = rc.querySelector('.fb-btn[data-resolved].selected');
+  const text = rc.querySelector('.fb-text').value;
+  const status = rc.querySelector('.fb-status');
+
+  const liked = likedBtn ? likedBtn.dataset.liked === 'true' : null;
+  const resolved = resolvedBtn ? resolvedBtn.dataset.resolved === 'true' : null;
+
+  status.textContent = 'Sending…';
+  try {
+    const res = await fetch('/api/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ interaction_id: id, liked, feedback_text: text, resolved })
+    });
+    const data = await res.json();
+    status.textContent = `✓ Reward: ${data.reward} | ${data.failure_reason}`;
+    status.style.color = '#00f5b4';
+    loadStyleWeights();
+  } catch {
+    status.textContent = '⚠ Failed';
+    status.style.color = '#f87171';
+  }
+}
+
+let trendChart, intentChart;
+async function loadAnalytics() {
+  try {
+    const res = await fetch('/api/analytics');
+    const d = await res.json();
+    document.getElementById('mv-total').textContent = d.total_interactions ?? '—';
+    document.getElementById('mv-accuracy').textContent = d.response_accuracy != null ? d.response_accuracy.toFixed(2) : '—';
+    document.getElementById('mv-resolution').textContent = d.resolution_rate != null ? (d.resolution_rate * 100).toFixed(1) + '%' : '—';
+    document.getElementById('mv-satisfaction').textContent = d.user_satisfaction != null ? d.user_satisfaction.toFixed(3) : '—';
+    document.getElementById('best-prompt-badge').textContent = d.best_prompt ? ('🏆 ' + d.best_prompt) : '—';
+    renderTrendChart(d.trend || []);
+    renderIntentChart(d.most_common_issues || []);
+  } catch {}
+}
+
+const CHART_DEFAULTS = { font: { family: "'JetBrains Mono', monospace", size: 11 }, color: '#94a3b8' };
+
+function renderTrendChart(trend) {
+  const labels = trend.map(r => r[0]);
+  const vals = trend.map(r => r[1]);
+  const ctx = document.getElementById('trend-chart').getContext('2d');
+  if (trendChart) trendChart.destroy();
+  trendChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets: [{ label: 'Avg Score', data: vals, borderColor: '#00f5b4', backgroundColor: 'rgba(0,245,180,0.07)', borderWidth: 2, pointBackgroundColor: '#00f5b4', tension: 0.4, fill: true }] },
+    options: { plugins: { legend: { labels: CHART_DEFAULTS } }, scales: { x: { ticks: CHART_DEFAULTS, grid: { color: 'rgba(255,255,255,0.05)' } }, y: { ticks: CHART_DEFAULTS, grid: { color: 'rgba(255,255,255,0.05)' }, min: 0, max: 10 } } }
+  });
+}
+
+function renderIntentChart(issues) {
+  const labels = issues.map(r => r[0]);
+  const vals = issues.map(r => r[1]);
+  const colors = ['#00f5b4','#f59e0b','#3b82f6','#ef4444','#8b5cf6'];
+  const ctx = document.getElementById('intent-chart').getContext('2d');
+  if (intentChart) intentChart.destroy();
+  intentChart = new Chart(ctx, { type: 'doughnut', data: { labels, datasets: [{ data: vals, backgroundColor: colors, borderColor: '#0a0f1e', borderWidth: 2 }] }, options: { plugins: { legend: { labels: { ...CHART_DEFAULTS, padding: 16 } } }, cutout: '65%' } });
+}
+
+async function loadStyleWeights() {
+  try {
+    const res = await fetch('/api/style-weights');
+    const d = await res.json();
+    renderStyleBars(d.style_weights || {});
+  } catch {}
+}
+
+function renderStyleBars(weights) {
+  const container = document.getElementById('style-bars');
+  const styles = ['professional','empathetic','technical','simple'];
+  const icons = { professional:'🎩', empathetic:'💙', technical:'⚙️', simple:'📖' };
+  container.innerHTML = styles.map(s => {
+    const w = Number(weights[s] ?? 1.0);
+    const pct = Math.round(((w - 0.5) / 2.0) * 100);
+    return `<div class="style-bar-row"><span class="style-label">${icons[s]} ${s}</span><div class="style-bar-bg"><div class="style-bar-fill" style="width:${pct}%"></div></div><span class="style-val">${w.toFixed(2)}</span></div>`;
+  }).join('');
+}
+renderStyleBars({});
+
+async function loadEvolution() {
+  const timeline = document.getElementById('evolution-timeline');
+  timeline.innerHTML = '<p class="muted loading-text">Loading evolution log…</p>';
+  try {
+    const res = await fetch('/api/prompt-evolution');
+    const d = await res.json();
+    if (!d.evolution || d.evolution.length === 0) {
+      timeline.innerHTML = '<p class="muted">No prompt evolution recorded yet. Submit feedback to trigger optimization.</p>';
+      return;
+    }
+    timeline.innerHTML = d.evolution.map(row => {
+      const [style, before, after, reason, ts] = row;
+      return `<div class="evo-entry"><div class="evo-header"><span class="evo-style">${STYLE_ICONS[style] || '🔬'} ${style}</span><span class="evo-reason muted">${reason}</span><span class="evo-ts muted">${ts}</span></div><div class="evo-diff"><div class="diff-block diff-before"><div class="diff-label">BEFORE</div>${escHtml(before)}</div><div class="diff-arrow">→</div><div class="diff-block diff-after"><div class="diff-label">AFTER</div>${escHtml(after)}</div></div></div>`;
+    }).join('');
+  } catch {
+    timeline.innerHTML = '<p class="muted">Failed to load. Is the backend running?</p>';
+  }
+}
+
+async function addKbDoc() {
+  const input = document.getElementById('kb-doc-input');
+  const text = input.value.trim();
+  if (!text) return;
+  try {
+    const res = await fetch('/api/kb/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+    if (res.ok) {
+      const div = document.createElement('div');
+      div.className = 'kb-item kb-new';
+      div.textContent = '✨ ' + text;
+      document.querySelector('.kb-seed-list').prepend(div);
+      input.value = '';
+    }
+  } catch {}
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+loadAnalytics();
+loadStyleWeights();
+</script>
+</body>
+</html>
