@@ -1,30 +1,22 @@
-"""Main orchestration for Self-Optimizing Customer Support Bot (Tech Support domain)."""
+"""FastAPI backend for feedback-driven self-optimizing customer support system."""
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import asdict, dataclass
 from typing import Dict, Optional
 
 import dspy
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
-from domain_kb import retrieve_relevant_faq
-from evaluator import EvaluationResult, choose_best, evaluate_response
-from feedback import (
-    detect_implicit_feedback,
-    detect_user_emotion,
-    detect_user_level,
-    parse_explicit_feedback,
-)
-from optimizer import DataStore, InteractionRecord, PromptOptimizer, timestamp_utc
-from prompts import generate_candidates
+from feedback_engine import build_feedback_event
+from optimizer import DataStore, InteractionRecord, timestamp_utc
+from query_processor import process_query
+from response_generator import Candidate, generate_multi_candidates
 
 
-LOW_SCORE_THRESHOLD = 6.8
-
-
-def configure_dspy_model() -> None:
+def configure_llm() -> None:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return
@@ -32,141 +24,174 @@ def configure_dspy_model() -> None:
     dspy.settings.configure(lm=lm)
 
 
-def _seconds_between(now_iso: str, previous_iso: Optional[str]) -> Optional[float]:
-    if not previous_iso:
-        return None
-    now = datetime.fromisoformat(now_iso)
-    prev = datetime.fromisoformat(previous_iso)
-    return (now - prev).total_seconds()
-
-
-def _format_context(history: list[tuple[str, str]]) -> str:
-    if not history:
-        return "No prior context."
-    chunks = []
-    for q, r in history:
-        chunks.append(f"User: {q}\nAssistant: {r[:240]}")
-    return "\n---\n".join(chunks)
-
-
-def _format_faq(query: str) -> str:
-    items = retrieve_relevant_faq(query)
-    if not items:
-        return "No matching FAQ entries."
-    return "\n".join([f"Q: {item.question}\nA: {item.answer}" for item in items])
-
-
 @dataclass
-class BotResult:
+class ResponseScore:
+    clarity: float
+    correctness: float
+    helpfulness: float
+    total: float
+    confidence: float
+
+
+def score_candidate(query: str, response: str, style_weight: float) -> ResponseScore:
+    q_tokens = {w.lower().strip(".,?!") for w in query.split() if len(w) > 3}
+    r_tokens = {w.lower().strip(".,?!") for w in response.split()}
+    overlap = len(q_tokens & r_tokens)
+
+    clarity = 6.0 + (1.0 if len(response.split()) <= 180 else -0.5)
+    correctness = 5.7 + min(2.5, overlap * 0.4)
+    helpfulness = 6.1 + (1.4 if any(x in response.lower() for x in ["step", "check", "verify", "if unresolved"]) else 0.0)
+
+    clarity = min(10.0, max(0.0, clarity))
+    correctness = min(10.0, max(0.0, correctness))
+    helpfulness = min(10.0, max(0.0, helpfulness))
+
+    weighted = (clarity * 0.3 + correctness * 0.3 + helpfulness * 0.4) * style_weight
+    total = min(10.0, round(weighted, 3))
+    confidence = round(min(0.98, max(0.2, total / 10)), 3)
+
+    return ResponseScore(
+        clarity=round(clarity, 3),
+        correctness=round(correctness, 3),
+        helpfulness=round(helpfulness, 3),
+        total=total,
+        confidence=confidence,
+    )
+
+
+class ChatRequest(BaseModel):
+    user_id: str = Field(default="demo-user")
     query: str
-    selected_style: str
+
+
+class ChatResponse(BaseModel):
+    interaction_id: int
+    intent: str
+    entities: Dict[str, str]
+    chosen_style: str
     response: str
-    evaluation: EvaluationResult
-    feedback_label: str
-    retry_used: bool
-    implicit_feedback: Dict[str, bool]
-    user_level: str
-    emotion: str
+    score: Dict[str, float]
+    retrieved_knowledge: list[str]
 
 
-class SelfOptimizingSupportBot:
-    def __init__(self) -> None:
-        configure_dspy_model()
-        self.store = DataStore()
-        self.optimizer = PromptOptimizer(self.store)
+class FeedbackRequest(BaseModel):
+    interaction_id: int
+    liked: Optional[bool] = None
+    feedback_text: str = ""
+    resolved: Optional[bool] = None
 
-    def handle_query(
-        self,
-        query: str,
-        rating: Optional[int] = None,
-        liked: Optional[bool] = None,
-        solved: Optional[bool] = None,
-        user_level: Optional[str] = None,
-    ) -> BotResult:
-        now = timestamp_utc()
-        seconds_since_last = _seconds_between(now, self.store.fetch_last_interaction_time())
-        emotion = detect_user_emotion(query)
-        level = detect_user_level(query, user_level)
 
-        prompt_bank = self.store.get_prompt_bank()
-        context = _format_context(self.store.fetch_recent_context(limit=3))
-        faq_context = _format_faq(query)
+configure_llm()
+store = DataStore()
+app = FastAPI(title="Self-Optimizing Customer Support System", version="2.0.0")
 
-        candidates = generate_candidates(
-            query=query,
-            prompt_bank=prompt_bank,
-            conversation_context=context,
-            faq_context=faq_context,
-            personalization=level,
-            emotion=emotion,
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(payload: ChatRequest) -> ChatResponse:
+    if not payload.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    qf = process_query(payload.query)
+    memory = store.get_recent_memory(user_id=payload.user_id)
+    rag_snippets = store.search_kb(payload.query, top_k=3)
+    style_boost = store.get_style_boost()
+
+    candidates = generate_multi_candidates(
+        query=payload.query,
+        intent=qf.intent,
+        entities=qf.entities,
+        history=memory,
+        retrieved_snippets=rag_snippets,
+        style_boost=style_boost,
+    )
+
+    ranked = []
+    for cand in candidates:
+        score = score_candidate(payload.query, cand.response, style_boost.get(cand.style, 1.0))
+        ranked.append((score.total, cand, score))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+
+    _, best_cand, best_score = ranked[0]
+
+    interaction_id = store.save_interaction(
+        InteractionRecord(
+            user_id=payload.user_id,
+            query=payload.query,
+            intent=qf.intent,
+            entities=str(qf.entities),
+            chosen_style=best_cand.style,
+            response=best_cand.response,
+            score=best_score.total,
+            confidence=best_score.confidence,
+            resolved=None,
+            created_at=timestamp_utc(),
         )
-        scored = {c.style_name: evaluate_response(query, c.response_text) for c in candidates}
+    )
 
-        best_style = choose_best(scored)
-        best_candidate = next(c for c in candidates if c.style_name == best_style)
-        best_eval = scored[best_style]
+    return ChatResponse(
+        interaction_id=interaction_id,
+        intent=qf.intent,
+        entities=qf.entities,
+        chosen_style=best_cand.style,
+        response=best_cand.response,
+        score=asdict(best_score),
+        retrieved_knowledge=rag_snippets,
+    )
 
-        recent_queries = self.store.fetch_recent_queries()
-        implicit = detect_implicit_feedback(query, recent_queries, seconds_since_last)
 
-        retry_used = False
-        if best_eval.total_score < LOW_SCORE_THRESHOLD or implicit.is_dissatisfied:
-            retry_used = True
-            alternatives = [c for c in candidates if c.style_name != best_style]
-            alternatives = sorted(alternatives, key=lambda c: scored[c.style_name].total_score, reverse=True)
-            if alternatives:
-                alt = alternatives[0]
-                best_style = alt.style_name
-                best_eval = scored[best_style]
-                best_candidate = alt
-                best_candidate.response_text = (
-                    "Let me explain this in a simpler way. " + best_candidate.response_text
-                    if level == "beginner"
-                    else "I'll provide a more technical fallback approach. " + best_candidate.response_text
-                )
+@app.post("/feedback")
+def feedback(payload: FeedbackRequest) -> Dict[str, object]:
+    event = build_feedback_event(
+        interaction_id=payload.interaction_id,
+        liked=payload.liked,
+        feedback_text=payload.feedback_text,
+        resolved=payload.resolved,
+    )
 
-        feedback_label = parse_explicit_feedback(rating=rating, liked=liked, solved=solved)
+    store.save_feedback(
+        interaction_id=event.interaction_id,
+        liked=event.liked,
+        feedback_text=event.feedback_text,
+        resolved=event.resolved,
+        reward=event.reward,
+        failure_reason=event.failure_reason,
+    )
 
-        self.store.save_interaction(
-            InteractionRecord(
-                query=query,
-                selected_style=best_style,
-                response=best_candidate.response_text,
-                total_score=best_eval.total_score,
-                feedback=feedback_label,
-                implicit_dissatisfied=implicit.is_dissatisfied,
-                solved=solved if solved is not None else best_eval.solved_yes_no,
-                confidence=best_eval.confidence,
-                user_level=level,
-                emotion=emotion,
-                created_at=now,
-            )
-        )
+    # Feedback-driven learning: adjust style reward and evolve weak prompts.
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT chosen_style FROM interactions WHERE id = ?",
+            (payload.interaction_id,),
+        ).fetchone()
+    if row:
+        store.update_style_reward(style=row[0], reward=event.reward)
+        store.evolve_weak_prompts()
 
-        for style, evaluation in scored.items():
-            self.optimizer.register_score(style, evaluation.total_score)
-        self.optimizer.optimize()
+    return {
+        "interaction_id": payload.interaction_id,
+        "reward": event.reward,
+        "failure_reason": event.failure_reason,
+        "status": "updated",
+    }
 
-        return BotResult(
-            query=query,
-            selected_style=best_style,
-            response=best_candidate.response_text,
-            evaluation=best_eval,
-            feedback_label=feedback_label,
-            retry_used=retry_used,
-            implicit_feedback={
-                "repeated_query": implicit.repeated_query,
-                "dissatisfaction_phrase": implicit.dissatisfaction_phrase,
-                "negative_sentiment": implicit.negative_sentiment,
-                "long_delay": implicit.long_delay,
-                "abandonment_risk": implicit.abandonment_risk,
-            },
-            user_level=level,
-            emotion=emotion,
-        )
+
+@app.get("/analytics")
+def analytics() -> Dict[str, object]:
+    return store.analytics()
+
+
+@app.get("/prompt-evolution")
+def prompt_evolution() -> Dict[str, object]:
+    rows = store.recent_prompt_evolution(limit=10)
+    return {"evolution": rows}
 
 
 if __name__ == "__main__":
-    bot = SelfOptimizingSupportBot()
-    result = bot.handle_query("I'm frustrated, app keeps logging me out and this is not helpful")
-    print(result)
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)

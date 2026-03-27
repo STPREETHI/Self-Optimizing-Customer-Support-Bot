@@ -1,4 +1,4 @@
-"""SQLite storage + GEPA-style prompt evolution + analytics utilities."""
+"""Persistence, retrieval, ranking, and feedback-driven prompt optimization."""
 
 from __future__ import annotations
 
@@ -8,250 +8,329 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from prompts import PROMPT_STYLES
+import numpy as np
 
 
-DB_PATH = Path("support_bot.db")
+DB_PATH = Path("support_system.db")
+
+DEFAULT_STYLE_WEIGHTS = {
+    "professional": 1.0,
+    "empathetic": 1.0,
+    "technical": 1.0,
+    "simple": 1.0,
+}
+
+KB_SEED = [
+    "Login issue: clear stale sessions, sync system clock, reset password tokens.",
+    "Refund issue: verify transaction ID, eligibility window, and payment gateway status.",
+    "Performance issue: inspect latency, deployment changes, and cache hit rate.",
+    "API errors: validate key scope, rate limits, and request schema.",
+]
 
 
 @dataclass
 class InteractionRecord:
+    user_id: str
     query: str
-    selected_style: str
+    intent: str
+    entities: str
+    chosen_style: str
     response: str
-    total_score: float
-    feedback: str
-    implicit_dissatisfied: bool
-    solved: bool
+    score: float
     confidence: float
-    user_level: str
-    emotion: str
+    resolved: Optional[bool]
     created_at: str
 
 
 class DataStore:
     def __init__(self, db_path: Path = DB_PATH) -> None:
         self.db_path = db_path
-        self._initialize()
+        self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
 
-    def _initialize(self) -> None:
+    def _init_db(self) -> None:
         with self._connect() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS interactions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
                     query TEXT NOT NULL,
-                    selected_style TEXT NOT NULL,
+                    intent TEXT NOT NULL,
+                    entities TEXT NOT NULL,
+                    chosen_style TEXT NOT NULL,
                     response TEXT NOT NULL,
-                    total_score REAL NOT NULL,
-                    feedback TEXT NOT NULL,
-                    implicit_dissatisfied INTEGER NOT NULL,
-                    solved INTEGER NOT NULL,
+                    score REAL NOT NULL,
                     confidence REAL NOT NULL,
-                    user_level TEXT NOT NULL,
-                    emotion TEXT NOT NULL,
+                    resolved INTEGER,
                     created_at TEXT NOT NULL
                 )
                 """
             )
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS prompt_bank (
-                    style_name TEXT PRIMARY KEY,
-                    prompt_text TEXT NOT NULL,
-                    uses INTEGER NOT NULL DEFAULT 0,
-                    avg_score REAL NOT NULL DEFAULT 0
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS prompt_versions (
+                CREATE TABLE IF NOT EXISTS feedback (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    style_name TEXT NOT NULL,
-                    old_prompt TEXT NOT NULL,
-                    new_prompt TEXT NOT NULL,
+                    interaction_id INTEGER NOT NULL,
+                    liked INTEGER,
+                    feedback_text TEXT,
+                    resolved INTEGER,
+                    reward REAL NOT NULL,
+                    failure_reason TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS prompt_profiles (
+                    style TEXT PRIMARY KEY,
+                    weight REAL NOT NULL,
+                    uses INTEGER NOT NULL DEFAULT 0,
+                    avg_reward REAL NOT NULL DEFAULT 0,
+                    prompt_hint TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS prompt_evolution (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    style TEXT NOT NULL,
+                    before_hint TEXT NOT NULL,
+                    after_hint TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS kb_vectors (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_text TEXT NOT NULL,
+                    embedding TEXT NOT NULL
                 )
                 """
             )
             conn.commit()
+
         self._seed_defaults()
 
     def _seed_defaults(self) -> None:
         with self._connect() as conn:
-            for style_name, prompt_text in PROMPT_STYLES.items():
+            for style, weight in DEFAULT_STYLE_WEIGHTS.items():
                 conn.execute(
-                    "INSERT INTO prompt_bank(style_name, prompt_text) VALUES(?, ?) ON CONFLICT(style_name) DO NOTHING",
-                    (style_name, prompt_text),
+                    """
+                    INSERT INTO prompt_profiles(style, weight, prompt_hint)
+                    VALUES(?, ?, ?)
+                    ON CONFLICT(style) DO NOTHING
+                    """,
+                    (style, weight, f"Base tone for {style} responses."),
                 )
+
+            existing = conn.execute("SELECT COUNT(*) FROM kb_vectors").fetchone()[0]
+            if existing == 0:
+                for text in KB_SEED:
+                    emb = self._embed(text)
+                    conn.execute(
+                        "INSERT INTO kb_vectors(source_text, embedding) VALUES(?, ?)",
+                        (text, self._serialize_vector(emb)),
+                    )
             conn.commit()
 
-    def get_prompt_bank(self) -> Dict[str, str]:
-        with self._connect() as conn:
-            rows = conn.execute("SELECT style_name, prompt_text FROM prompt_bank").fetchall()
-        return {name: text for name, text in rows}
+    @staticmethod
+    def _embed(text: str, dim: int = 128) -> np.ndarray:
+        vec = np.zeros(dim, dtype=float)
+        for token in text.lower().split():
+            vec[hash(token) % dim] += 1
+        norm = np.linalg.norm(vec)
+        return vec / norm if norm else vec
 
-    def update_prompt_metrics(self, style_name: str, new_score: float) -> None:
+    @staticmethod
+    def _serialize_vector(vec: np.ndarray) -> str:
+        return ",".join([f"{x:.6f}" for x in vec.tolist()])
+
+    @staticmethod
+    def _deserialize_vector(raw: str) -> np.ndarray:
+        return np.array([float(x) for x in raw.split(",")], dtype=float)
+
+    def add_kb_document(self, text: str) -> None:
+        emb = self._embed(text)
         with self._connect() as conn:
-            uses, avg = conn.execute(
-                "SELECT uses, avg_score FROM prompt_bank WHERE style_name = ?",
-                (style_name,),
-            ).fetchone()
-            uses += 1
-            avg = ((avg * (uses - 1)) + new_score) / uses
             conn.execute(
-                "UPDATE prompt_bank SET uses = ?, avg_score = ? WHERE style_name = ?",
-                (uses, round(avg, 4), style_name),
+                "INSERT INTO kb_vectors(source_text, embedding) VALUES(?, ?)",
+                (text, self._serialize_vector(emb)),
             )
             conn.commit()
 
-    def save_interaction(self, record: InteractionRecord) -> None:
+    def search_kb(self, query: str, top_k: int = 3) -> List[str]:
+        q = self._embed(query)
         with self._connect() as conn:
-            conn.execute(
+            rows = conn.execute("SELECT source_text, embedding FROM kb_vectors").fetchall()
+
+        scored = []
+        for source_text, raw_emb in rows:
+            emb = self._deserialize_vector(raw_emb)
+            score = float(np.dot(q, emb))
+            scored.append((score, source_text))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [t for _, t in scored[:top_k]]
+
+    def save_interaction(self, record: InteractionRecord) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
                 """
                 INSERT INTO interactions(
-                    query, selected_style, response, total_score, feedback,
-                    implicit_dissatisfied, solved, confidence, user_level, emotion, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    user_id, query, intent, entities, chosen_style, response, score,
+                    confidence, resolved, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    record.user_id,
                     record.query,
-                    record.selected_style,
+                    record.intent,
+                    record.entities,
+                    record.chosen_style,
                     record.response,
-                    record.total_score,
-                    record.feedback,
-                    int(record.implicit_dissatisfied),
-                    int(record.solved),
+                    record.score,
                     record.confidence,
-                    record.user_level,
-                    record.emotion,
+                    None if record.resolved is None else int(record.resolved),
                     record.created_at,
                 ),
             )
             conn.commit()
+            return int(cur.lastrowid)
 
-    def fetch_recent_queries(self, limit: int = 20) -> List[str]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT query FROM interactions ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        return [r[0] for r in rows]
-
-    def fetch_recent_context(self, limit: int = 3) -> List[Tuple[str, str]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT query, response FROM interactions ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        return rows
-
-    def fetch_last_interaction_time(self) -> Optional[str]:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT created_at FROM interactions ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-        return row[0] if row else None
-
-    def fetch_history(self, limit: int = 50) -> List[Tuple]:
-        with self._connect() as conn:
-            return conn.execute(
-                """
-                SELECT query, selected_style, total_score, feedback, solved,
-                       implicit_dissatisfied, confidence, user_level, emotion, created_at
-                FROM interactions ORDER BY id DESC LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-
-    def fetch_prompt_rankings(self) -> List[Tuple]:
-        with self._connect() as conn:
-            return conn.execute(
-                "SELECT style_name, uses, avg_score FROM prompt_bank ORDER BY avg_score DESC"
-            ).fetchall()
-
-    def save_prompt_version(self, style_name: str, old_prompt: str, new_prompt: str) -> None:
+    def save_feedback(
+        self,
+        interaction_id: int,
+        liked: Optional[bool],
+        feedback_text: str,
+        resolved: Optional[bool],
+        reward: float,
+        failure_reason: str,
+    ) -> None:
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO prompt_versions(style_name, old_prompt, new_prompt, created_at) VALUES(?, ?, ?, ?)",
-                (style_name, old_prompt, new_prompt, timestamp_utc()),
+                """
+                INSERT INTO feedback(interaction_id, liked, feedback_text, resolved, reward, failure_reason, created_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    interaction_id,
+                    None if liked is None else int(liked),
+                    feedback_text,
+                    None if resolved is None else int(resolved),
+                    reward,
+                    failure_reason,
+                    timestamp_utc(),
+                ),
             )
             conn.commit()
 
-    def fetch_prompt_improvements(self, limit: int = 20) -> List[Tuple]:
+    def get_recent_memory(self, user_id: str, limit: int = 4) -> List[Tuple[str, str]]:
         with self._connect() as conn:
-            return conn.execute(
-                "SELECT style_name, old_prompt, new_prompt, created_at FROM prompt_versions ORDER BY id DESC LIMIT ?",
-                (limit,),
+            rows = conn.execute(
+                "SELECT query, response FROM interactions WHERE user_id=? ORDER BY id DESC LIMIT ?",
+                (user_id, limit),
             ).fetchall()
+        return rows
+
+    def get_style_boost(self) -> Dict[str, float]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT style, weight FROM prompt_profiles").fetchall()
+        return {style: weight for style, weight in rows}
+
+    def update_style_reward(self, style: str, reward: float) -> None:
+        with self._connect() as conn:
+            uses, avg_reward, weight, hint = conn.execute(
+                "SELECT uses, avg_reward, weight, prompt_hint FROM prompt_profiles WHERE style=?",
+                (style,),
+            ).fetchone()
+            new_uses = uses + 1
+            new_avg = ((avg_reward * uses) + reward) / new_uses
+            new_weight = min(2.5, max(0.5, weight + (0.08 * reward)))
+
+            conn.execute(
+                "UPDATE prompt_profiles SET uses=?, avg_reward=?, weight=? WHERE style=?",
+                (new_uses, round(new_avg, 4), round(new_weight, 4), style),
+            )
+            conn.commit()
+
+    def evolve_weak_prompts(self) -> None:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT style, weight, avg_reward, prompt_hint FROM prompt_profiles"
+            ).fetchall()
+            if len(rows) < 2:
+                return
+
+            ranked = sorted(rows, key=lambda r: r[2], reverse=True)
+            best_style, _, best_avg, best_hint = ranked[0]
+            weak_style, _, weak_avg, weak_hint = ranked[-1]
+
+            if best_avg - weak_avg < 0.2:
+                return
+
+            improved_hint = (
+                f"{weak_hint} Add concrete examples, shorten instructions, and include "
+                f"a resolution-check question. Borrow successful pattern from {best_style}: {best_hint}"
+            )
+
+            conn.execute(
+                "UPDATE prompt_profiles SET prompt_hint=? WHERE style=?",
+                (improved_hint, weak_style),
+            )
+            conn.execute(
+                "INSERT INTO prompt_evolution(style, before_hint, after_hint, reason, created_at) VALUES(?, ?, ?, ?, ?)",
+                (
+                    weak_style,
+                    weak_hint,
+                    improved_hint,
+                    "low reward vs top style",
+                    timestamp_utc(),
+                ),
+            )
+            conn.commit()
 
     def analytics(self) -> Dict[str, object]:
         with self._connect() as conn:
             total = conn.execute("SELECT COUNT(*) FROM interactions").fetchone()[0]
-            sat = conn.execute(
-                "SELECT COUNT(*) FROM interactions WHERE feedback IN ('like','positive_rating','solved_yes')"
+            avg_score = conn.execute("SELECT AVG(score) FROM interactions").fetchone()[0]
+            resolution_rate = conn.execute(
+                "SELECT AVG(CASE WHEN resolved=1 THEN 1.0 ELSE 0.0 END) FROM interactions WHERE resolved IS NOT NULL"
             ).fetchone()[0]
-            failed_rows = conn.execute(
-                "SELECT query, COUNT(*) c FROM interactions WHERE solved = 0 GROUP BY query ORDER BY c DESC LIMIT 5"
+            satisfaction = conn.execute("SELECT AVG(reward) FROM feedback").fetchone()[0]
+            common_issues = conn.execute(
+                "SELECT intent, COUNT(*) c FROM interactions GROUP BY intent ORDER BY c DESC LIMIT 5"
             ).fetchall()
             trend = conn.execute(
-                "SELECT substr(created_at,1,10) d, AVG(total_score) FROM interactions GROUP BY d ORDER BY d"
+                "SELECT substr(created_at,1,10) d, AVG(score) FROM interactions GROUP BY d ORDER BY d"
             ).fetchall()
             best_prompt = conn.execute(
-                "SELECT style_name FROM prompt_bank ORDER BY avg_score DESC LIMIT 1"
+                "SELECT style FROM prompt_profiles ORDER BY avg_reward DESC LIMIT 1"
             ).fetchone()
+
         return {
             "total_interactions": total,
-            "satisfaction_rate": round(sat / total, 3) if total else None,
+            "response_accuracy": round(avg_score, 3) if avg_score is not None else None,
+            "resolution_rate": round(resolution_rate, 3) if resolution_rate is not None else None,
+            "user_satisfaction": round(satisfaction, 3) if satisfaction is not None else None,
+            "most_common_issues": common_issues,
+            "trend": trend,
             "best_prompt": best_prompt[0] if best_prompt else None,
-            "most_failed_queries": failed_rows,
-            "improvement_trend": trend,
         }
 
-
-class PromptOptimizer:
-    def __init__(self, store: DataStore) -> None:
-        self.store = store
-
-    def register_score(self, style_name: str, score: float) -> None:
-        self.store.update_prompt_metrics(style_name, score)
-
-    def optimize(self) -> Dict[str, str]:
-        with self.store._connect() as conn:
-            rows = conn.execute("SELECT style_name, prompt_text, uses, avg_score FROM prompt_bank").fetchall()
-            if any(uses == 0 for _, _, uses, _ in rows):
-                return {n: p for n, p, _, _ in rows}
-
-            ranked = sorted(rows, key=lambda r: r[3], reverse=True)
-            top_style, top_prompt, _, top_score = ranked[0]
-            weak_style, weak_prompt, _, weak_score = ranked[-1]
-
-            if top_score - weak_score < 0.7:
-                return {n: p for n, p, _, _ in rows}
-
-            improved = self._mutate_prompt(weak_prompt, top_prompt, weak_style)
-            conn.execute("UPDATE prompt_bank SET prompt_text = ? WHERE style_name = ?", (improved, weak_style))
-            conn.commit()
-
-        self.store.save_prompt_version(weak_style, weak_prompt, improved)
-        return self.store.get_prompt_bank()
-
-    @staticmethod
-    def _mutate_prompt(weak_prompt: str, top_prompt: str, weak_style: str) -> str:
-        example_block = (
-            "Example: User says 'app keeps timing out'. Assistant should provide 3 checks, "
-            "a quick fix, and escalation path."
-        )
-        constraints = "Constraints: keep under 180 words; include one verification step and one fallback path."
-        return (
-            f"[GEPA-Mutated for {weak_style}] {weak_prompt} "
-            f"Borrow strengths from high performer: {top_prompt}. "
-            f"{example_block} Change tone to be clearer and more action-oriented. {constraints}"
-        )
+    def recent_prompt_evolution(self, limit: int = 10) -> List[Tuple]:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT style, before_hint, after_hint, reason, created_at FROM prompt_evolution ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
 
 
 def timestamp_utc() -> str:

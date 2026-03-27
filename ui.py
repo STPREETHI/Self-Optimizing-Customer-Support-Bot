@@ -1,109 +1,65 @@
-"""Streamlit interface with chat, explainability, and analytics dashboard."""
+"""Flask UI with HTML/CSS for the self-optimizing support system."""
 
 from __future__ import annotations
 
-import pandas as pd
-import streamlit as st
+import os
 
-from main import SelfOptimizingSupportBot
+import requests
+from flask import Flask, redirect, render_template, request, url_for
 
 
-st.set_page_config(page_title="Self-Optimizing Customer Support Bot", layout="wide")
+API_BASE = os.getenv("SUPPORT_API_BASE", "http://127.0.0.1:8000")
 
-if "bot" not in st.session_state:
-    st.session_state.bot = SelfOptimizingSupportBot()
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+app = Flask(__name__)
+SESSION_CACHE = []
 
-bot = st.session_state.bot
 
-st.title("🤖 Self-Optimizing Customer Support Bot (Tech Support)")
-st.caption("Multi-style DSPy responses, memory, retries, prompt evolution, and real-time learning")
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if request.method == "POST":
+        query = request.form.get("query", "").strip()
+        user_id = request.form.get("user_id", "demo-user").strip() or "demo-user"
 
-with st.sidebar:
-    st.header("Analytics Dashboard")
-    stats = bot.store.analytics()
-    st.metric("Total interactions", stats["total_interactions"])
-    st.metric(
-        "Satisfaction rate",
-        f"{stats['satisfaction_rate']:.1%}" if stats["satisfaction_rate"] is not None else "N/A",
+        if query:
+            resp = requests.post(f"{API_BASE}/chat", json={"user_id": user_id, "query": query}, timeout=15)
+            if resp.ok:
+                payload = resp.json()
+                SESSION_CACHE.append(payload)
+            else:
+                SESSION_CACHE.append({"error": f"Chat request failed: {resp.text}"})
+
+        return redirect(url_for("index"))
+
+    analytics = {}
+    try:
+        analytics = requests.get(f"{API_BASE}/analytics", timeout=10).json()
+    except Exception:
+        analytics = {"error": "Backend unavailable. Run FastAPI service first."}
+
+    return render_template("index.html", interactions=list(reversed(SESSION_CACHE[-20:])), analytics=analytics)
+
+
+@app.route("/submit-feedback", methods=["POST"])
+def submit_feedback():
+    interaction_id = int(request.form["interaction_id"])
+    liked_raw = request.form.get("liked", "")
+    liked = None if liked_raw == "" else liked_raw == "true"
+    resolved_raw = request.form.get("resolved", "")
+    resolved = None if resolved_raw == "" else resolved_raw == "true"
+    feedback_text = request.form.get("feedback_text", "")
+
+    requests.post(
+        f"{API_BASE}/feedback",
+        json={
+            "interaction_id": interaction_id,
+            "liked": liked,
+            "feedback_text": feedback_text,
+            "resolved": resolved,
+        },
+        timeout=15,
     )
-    st.metric("Best prompt", stats["best_prompt"] or "N/A")
+    return redirect(url_for("index"))
 
-    st.subheader("Most Failed Queries")
-    if stats["most_failed_queries"]:
-        st.table(pd.DataFrame(stats["most_failed_queries"], columns=["Query", "Failures"]))
-    else:
-        st.info("No failed-query records yet.")
 
-    st.subheader("Improvement Over Time")
-    if stats["improvement_trend"]:
-        trend_df = pd.DataFrame(stats["improvement_trend"], columns=["date", "avg_score"]).set_index("date")
-        st.line_chart(trend_df)
-    else:
-        st.info("Not enough data to show trend.")
-
-st.subheader("Chat")
-user_query = st.text_input("Describe your technical issue")
-cols = st.columns(5)
-with cols[0]:
-    liked = st.button("👍 Like")
-with cols[1]:
-    disliked = st.button("👎 Dislike")
-with cols[2]:
-    rating = st.slider("Rating", 1, 5, 3)
-with cols[3]:
-    solved = st.selectbox("Solved?", ["Unknown", "Yes", "No"])
-with cols[4]:
-    user_level = st.selectbox("User Level", ["auto", "beginner", "expert"])
-
-if st.button("Send") and user_query.strip():
-    solved_value = None if solved == "Unknown" else solved == "Yes"
-    result = bot.handle_query(
-        query=user_query.strip(),
-        rating=rating,
-        liked=True if liked else False if disliked else None,
-        solved=solved_value,
-        user_level=None if user_level == "auto" else user_level,
-    )
-
-    st.session_state.messages.append(
-        {
-            "query": user_query,
-            "response": result.response,
-            "style": result.selected_style,
-            "score": result.evaluation.total_score,
-            "confidence": result.evaluation.confidence,
-            "reasoning": result.evaluation.reasoning,
-            "solved": result.evaluation.solved_yes_no,
-            "retry": result.retry_used,
-            "implicit": result.implicit_feedback,
-            "user_level": result.user_level,
-            "emotion": result.emotion,
-        }
-    )
-
-if st.session_state.messages:
-    st.subheader("Conversation History")
-    for item in reversed(st.session_state.messages):
-        with st.expander(f"Q: {item['query'][:90]}"):
-            st.markdown(f"**Response style:** `{item['style']}`")
-            st.markdown(f"**Detected profile:** `{item['user_level']}` | **Emotion:** `{item['emotion']}`")
-            st.markdown(f"**Answer:** {item['response']}")
-            st.markdown(f"**Score:** `{item['score']}` | **Confidence:** `{item['confidence']}`")
-            st.markdown(f"**Did this solve the problem?** `{item['solved']}`")
-            st.markdown(f"**Why this answer?** {item['reasoning']}")
-            st.markdown(f"**Retry used:** `{item['retry']}`")
-            st.json(item["implicit"])
-
-st.subheader("Prompt Evolution (Before vs After)")
-versions = bot.store.fetch_prompt_improvements(limit=5)
-if versions:
-    for style, old_prompt, new_prompt, created_at in versions:
-        with st.expander(f"{style} | {created_at}"):
-            st.markdown("**Before**")
-            st.code(old_prompt)
-            st.markdown("**After**")
-            st.code(new_prompt)
-else:
-    st.info("No prompt mutations yet. Continue chatting to trigger optimization.")
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)

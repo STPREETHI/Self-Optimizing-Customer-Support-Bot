@@ -1,3 +1,6 @@
 dspy-ai>=2.6.0
-streamlit>=1.40.0
-pandas>=2.2.0
+fastapi>=0.116.0
+uvicorn>=0.35.0
+flask>=3.1.0
+requests>=2.32.0
+numpy>=2.1.0
