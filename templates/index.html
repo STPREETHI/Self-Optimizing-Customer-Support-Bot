@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Self-Optimizing Support System</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Self-Optimizing Customer Support System</h1>
+      <p>Feedback-driven learning + prompt evolution + analytics</p>
+    </header>
+
+    <section class="panel">
+      <h2>Ask a question</h2>
+      <form method="POST" class="chat-form">
+        <input name="user_id" placeholder="User ID" value="demo-user" />
+        <textarea name="query" placeholder="Describe your issue..."></textarea>
+        <button type="submit">Send</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>Analytics</h2>
+      <pre>{{ analytics }}</pre>
+    </section>
+
+    <section class="panel">
+      <h2>Recent Interactions</h2>
+      {% for item in interactions %}
+        <div class="card">
+          {% if item.error %}
+            <p class="error">{{ item.error }}</p>
+          {% else %}
+            <p><strong>Intent:</strong> {{ item.intent }} | <strong>Style:</strong> {{ item.chosen_style }}</p>
+            <p><strong>Query:</strong> {{ item.get('query', 'N/A') }}</p>
+            <p><strong>Response:</strong> {{ item.response }}</p>
+            <p><strong>Score:</strong> {{ item.score.total }} | <strong>Confidence:</strong> {{ item.score.confidence }}</p>
+            <form method="POST" action="{{ url_for('submit_feedback') }}" class="feedback-form">
+              <input type="hidden" name="interaction_id" value="{{ item.interaction_id }}" />
+              <label>Like?
+                <select name="liked">
+                  <option value="">--</option>
+                  <option value="true">👍</option>
+                  <option value="false">👎</option>
+                </select>
+              </label>
+              <label>Resolved?
+                <select name="resolved">
+                  <option value="">--</option>
+                  <option value="true">Yes</option>
+                  <option value="false">No</option>
+                </select>
+              </label>
+              <input name="feedback_text" placeholder="Optional feedback text" />
+              <button type="submit">Submit Feedback</button>
+            </form>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </section>
+  </div>
+</body>
+</html>
